@@ -1,143 +1,182 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# ==============================================================================
+# upload-issues.sh — Bulk GitHub issue uploader for personal-cloud
+#
+# Origin: Adapted from staylor11x/spider-solitaire:create-issue.sh
+#   - Original: processes one .md file per call; extracts title from first H1,
+#     body from everything after it; passes labels and assignee as positional
+#     arguments; always assigns to @me.
+#   - Reused:   H1 title extraction, body extraction, gh issue create pattern.
+#   - Adapted:  bulk directory processing, YAML frontmatter for labels, milestone
+#     flag, repo auto-detection via gh repo view, structured summary output,
+#     accumulated error handling (does not stop on first failure).
+#   - Dropped:  interactive assignee argument; issues are never auto-assigned.
+#
+# Usage:
+#   ./scripts/upload-issues.sh <issues-dir> [--repo OWNER/REPO] [--milestone NAME]
+#
+#   issues-dir         Directory containing .md issue definition files.
+#   --repo OWNER/REPO  Target repository. Defaults to current repo (gh repo view).
+#   --milestone NAME   Milestone name to attach to every issue created. The
+#                      milestone must already exist on the target repository.
+#
+# Input file format: see scripts/README.md
+#
+# Requirements: bash 4+, gh CLI (authenticated with repo scope)
+# ==============================================================================
 
-usage() {
-  cat <<'USAGE' >&2
-Usage: create-issue.sh --owner <owner> --repo <repo> --title <title> [--body <body>] [--labels <l1,l2>] [--assignees <u1,u2>]
-USAGE
-}
+set -uo pipefail
 
-json_string() {
-  python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
-}
-
-emit_error() {
-  local provider="$1"
-  local message="$2"
-  printf '{"ok":false,"provider":%s,"error":%s}\n' "$(json_string "$provider")" "$(json_string "$message")"
-}
-
-emit_success() {
-  local provider="$1"
-  local number="$2"
-  local url="$3"
-  local title="$4"
-  printf '{"ok":true,"provider":%s,"issue_number":%s,"issue_url":%s,"title":%s}\n' \
-    "$(json_string "$provider")" \
-    "${number:-null}" \
-    "$(json_string "$url")" \
-    "$(json_string "$title")"
-}
-
-owner=""
-repo=""
-title=""
-body=""
-labels=""
-assignees=""
+ISSUES_DIR=""
+REPO=""
+MILESTONE=""
 
 while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --owner) owner="$2"; shift 2 ;;
-    --repo) repo="$2"; shift 2 ;;
-    --title) title="$2"; shift 2 ;;
-    --body) body="$2"; shift 2 ;;
-    --labels) labels="$2"; shift 2 ;;
-    --assignees) assignees="$2"; shift 2 ;;
-    -h|--help) usage; exit 0 ;;
-    *) usage; emit_error "none" "Unknown argument: $1"; exit 2 ;;
-  esac
+    case "$1" in
+        --repo)
+            REPO="$2"
+            shift 2
+            ;;
+        --milestone)
+            MILESTONE="$2"
+            shift 2
+            ;;
+        -*)
+            echo "Error: Unknown option: $1" >&2
+            echo "Usage: $0 <issues-dir> [--repo OWNER/REPO] [--milestone NAME]" >&2
+            exit 1
+            ;;
+        *)
+            if [[ -z "$ISSUES_DIR" ]]; then
+                ISSUES_DIR="$1"
+            else
+                echo "Error: Unexpected argument: $1" >&2
+                exit 1
+            fi
+            shift
+            ;;
+    esac
 done
 
-if [[ -z "$owner" || -z "$repo" || -z "$title" ]]; then
-  usage
-  emit_error "none" "Missing required flags: --owner, --repo, --title"
-  exit 2
+if [[ -z "$ISSUES_DIR" ]]; then
+    echo "Error: issues-dir is required." >&2
+    echo "Usage: $0 <issues-dir> [--repo OWNER/REPO] [--milestone NAME]" >&2
+    exit 1
 fi
 
-mcp_cmd="${AGENT_TOOLS_GITHUB_MCP_CMD:-}"
-if [[ -z "$mcp_cmd" ]] && command -v github-mcp >/dev/null 2>&1; then
-  mcp_cmd="github-mcp"
+if [[ ! -d "$ISSUES_DIR" ]]; then
+    echo "Error: '$ISSUES_DIR' is not a directory or does not exist." >&2
+    exit 1
 fi
 
-if [[ -n "$mcp_cmd" ]]; then
-  set +e
-  mcp_output="$($mcp_cmd create-issue --owner "$owner" --repo "$repo" --title "$title" --body "$body" --labels "$labels" --assignees "$assignees" 2>/dev/null)"
-  mcp_exit=$?
-  set -e
-
-  if [[ $mcp_exit -eq 0 && -n "$mcp_output" ]]; then
-    parsed="$(python3 -c 'import json,sys
-try:
-    data=json.loads(sys.stdin.read())
-    n=data.get("issue_number", data.get("number"))
-    u=data.get("issue_url", data.get("url", ""))
-    t=data.get("title", "")
-    if u:
-        print("{}\t{}\t{}".format("" if n is None else n, u, t))
-except Exception:
-    pass
-' <<<"$mcp_output")"
-
-    if [[ -n "$parsed" ]]; then
-      IFS=$'\t' read -r issue_number issue_url issue_title <<<"$parsed"
-      emit_success "mcp" "$issue_number" "$issue_url" "${issue_title:-$title}"
-      exit 0
+# Resolve repository — detect from git context if not specified
+if [[ -z "$REPO" ]]; then
+    if ! REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null); then
+        echo "Error: Could not detect current repository." >&2
+        echo "       Run from within a git repo or pass --repo OWNER/REPO." >&2
+        exit 1
     fi
-  fi
 fi
 
-if ! command -v gh >/dev/null 2>&1; then
-  emit_error "none" "GitHub MCP unavailable and gh CLI not installed"
-  exit 1
+echo "Repository: $REPO"
+[[ -n "$MILESTONE" ]] && echo "Milestone:  $MILESTONE"
+echo ""
+
+# Collect .md files in alphabetical order
+mapfile -t FILES < <(find "$ISSUES_DIR" -maxdepth 1 -name "*.md" | sort)
+
+if [[ ${#FILES[@]} -eq 0 ]]; then
+    echo "Error: No .md files found in '$ISSUES_DIR'." >&2
+    exit 1
 fi
 
-create_args=(issue create --repo "$owner/$repo" --title "$title")
-if [[ -n "$body" ]]; then
-  create_args+=(--body "$body")
-else
-  create_args+=(--body "")
-fi
-if [[ -n "$labels" ]]; then
-  IFS=',' read -ra label_array <<<"$labels"
-  for label in "${label_array[@]}"; do
-    create_args+=(--label "$label")
-  done
-fi
-if [[ -n "$assignees" ]]; then
-  IFS=',' read -ra assignee_array <<<"$assignees"
-  for assignee in "${assignee_array[@]}"; do
-    create_args+=(--assignee "$assignee")
-  done
+echo "Found ${#FILES[@]} issue file(s)."
+echo ""
+
+CREATED_URLS=()
+FAILED_FILES=()
+
+for FILE in "${FILES[@]}"; do
+    BASENAME=$(basename "$FILE")
+
+    # Detect optional YAML frontmatter (file must start with exactly ---)
+    HAS_FRONTMATTER=0
+    if [[ "$(head -1 "$FILE")" == "---" ]]; then
+        HAS_FRONTMATTER=1
+    fi
+
+    # Parse frontmatter fields (text between opening and closing ---)
+    FM_TITLE=""
+    FM_LABELS=""
+    if [[ "$HAS_FRONTMATTER" -eq 1 ]]; then
+        FRONTMATTER=$(awk 'NR==1{next} /^---$/{exit} {print}' "$FILE")
+        FM_TITLE=$(printf '%s\n' "$FRONTMATTER" | grep "^title:" | head -1 \
+            | sed 's/^title:[[:space:]]*//' | tr -d "\"'")
+        FM_LABELS=$(printf '%s\n' "$FRONTMATTER" | grep "^labels:" | head -1 \
+            | sed 's/^labels:[[:space:]]*//' | tr -d "\"'")
+    fi
+
+    # Resolve title: frontmatter field > first H1 > filename without extension
+    TITLE="$FM_TITLE"
+    if [[ -z "$TITLE" ]]; then
+        TITLE=$(grep "^# " "$FILE" | head -1 | sed 's/^# //')
+    fi
+    if [[ -z "$TITLE" ]]; then
+        TITLE=$(basename "$FILE" .md)
+    fi
+
+    # Extract body
+    if [[ "$HAS_FRONTMATTER" -eq 1 ]]; then
+        # Body is everything after the closing ---
+        BODY=$(awk 'BEGIN{c=0} /^---$/{c++; if(c==2){body=1; next}} body' "$FILE")
+    else
+        # Mirrors spider-solitaire: everything after the first H1 line
+        BODY=$(sed '1,/^# /d' "$FILE")
+        [[ -z "$BODY" ]] && BODY=$(cat "$FILE")
+    fi
+
+    echo "Uploading: $BASENAME"
+    echo "  Title:  $TITLE"
+    [[ -n "$FM_LABELS" ]] && echo "  Labels: $FM_LABELS"
+
+    GH_ARGS=(--repo "$REPO" --title "$TITLE" --body "$BODY")
+    [[ -n "$FM_LABELS" ]] && GH_ARGS+=(--label "$FM_LABELS")
+    [[ -n "$MILESTONE" ]] && GH_ARGS+=(--milestone "$MILESTONE")
+
+    URL=$(gh issue create "${GH_ARGS[@]}" 2>&1)
+    EXIT_CODE=$?
+
+    if [[ "$EXIT_CODE" -ne 0 ]]; then
+        echo "  ERROR: Failed to create issue." >&2
+        echo "         $URL" >&2
+        FAILED_FILES+=("$BASENAME")
+    else
+        echo "  Created: $URL"
+        CREATED_URLS+=("$URL")
+    fi
+
+    echo ""
+done
+
+echo "=============================="
+echo "Summary"
+echo "=============================="
+echo "Created: ${#CREATED_URLS[@]}"
+echo "Failed:  ${#FAILED_FILES[@]}"
+echo ""
+
+if [[ ${#CREATED_URLS[@]} -gt 0 ]]; then
+    echo "Created issues:"
+    for URL in "${CREATED_URLS[@]}"; do
+        echo "  $URL"
+    done
 fi
 
-set +e
-issue_url="$(gh "${create_args[@]}" 2>/dev/null)"
-gh_exit=$?
-set -e
-if [[ $gh_exit -ne 0 || -z "$issue_url" ]]; then
-  emit_error "gh" "Failed to create issue via gh CLI"
-  exit 1
+if [[ ${#FAILED_FILES[@]} -gt 0 ]]; then
+    echo ""
+    echo "Failed files:"
+    for F in "${FAILED_FILES[@]}"; do
+        echo "  $F"
+    done
+    exit 1
 fi
-
-set +e
-issue_view_json="$(gh issue view "$issue_url" --repo "$owner/$repo" --json number,url,title 2>/dev/null)"
-view_exit=$?
-set -e
-
-if [[ $view_exit -eq 0 && -n "$issue_view_json" ]]; then
-  parsed="$(python3 -c 'import json,sys
-try:
-    data=json.loads(sys.stdin.read())
-    print("{}\t{}\t{}".format(data.get("number", ""), data.get("url", ""), data.get("title", "")))
-except Exception:
-    pass
-' <<<"$issue_view_json")"
-  if [[ -n "$parsed" ]]; then
-    IFS=$'\t' read -r issue_number parsed_url parsed_title <<<"$parsed"
-    emit_success "gh" "$issue_number" "${parsed_url:-$issue_url}" "${parsed_title:-$title}"
-    exit 0
-  fi
-fi
-
-emit_success "gh" "" "$issue_url" "$title"
