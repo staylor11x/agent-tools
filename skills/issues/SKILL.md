@@ -1,4 +1,14 @@
-# GitHub Skill
+what do we need to include here?
+
+- use the issue template `skills\issues\issue-template.md`
+- how to upload 1 issue (using gh command)
+- how to upload multiple issues (using script)
+- all scripts now located in `skills\issues\scripts`
+
+
+
+
+# GitHub Skill (outdated)
 
 Use GitHub tooling from this repository for all issue and PR automation.
 
