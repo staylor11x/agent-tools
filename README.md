@@ -7,4 +7,3 @@ Shared SDK for AI coding agents.
 - `scripts/` reusable automation scripts with MCP-first and CLI fallback behavior
 - `skills/` instructions that tell agents when/how to call scripts
 - `AGENTS.md` SDK-level rules for script-first tooling
-- `AGENTS.consuming-project-template.md` template entry for repos that mount this SDK as `.agent-tools/`
